@@ -82,9 +82,17 @@ Rewrite `train.py` and `prepare.py` on top of MLX so the autoresearch harness ru
 | # | Severity | File | Description | Status |
 |---|----------|------|-------------|--------|
 
+<!-- All six iteration-1 review issues resolved in iteration 2 (see below). -->
+
 ## Resolved Review Issues
 
 <!-- Issues moved here once addressed by the coder and confirmed by reviewer -->
 
 | # | Severity | File | Description | Resolution |
 |---|----------|------|-------------|------------|
+| 1 | should-fix | train.py | Compiled `step_fn` scope narrower than plan/DD — only fwd + `value_and_grad` inside `mx.compile`; accumulation, scale, and `optimizer.update` ran in Python. | Added `apply_fn = mx.compile(inputs=[model.state, optimizer.state], outputs=…)` that fuses the inverse-accum scale with `optimizer.update`; training loop now calls `apply_fn(accum_grads)` per step. Tree-sum accumulation stays in Python (needed for grad accumulation), matching DD §Compilation. |
+| 2 | should-fix | train.py | AdamW hyperparameter collapse: all non-Muon params routed through a single AdamW at `EMBEDDING_LR * dmodel_lr_scale`, betas `(0.8, 0.95)`, losing upstream's 4 per-group LRs/betas. | Split into 4 AdamW instances via `MultiOptimizer([muon, adamw_lm_head, adamw_embeds, adamw_resid, adamw_x0], filters=[...])`: `lm_head` at `UNEMBEDDING_LR*dmodel_scale`, `wte+value_embeds` at `EMBEDDING_LR*dmodel_scale`, `resid_lambdas` at `SCALAR_LR*0.01`, `x0_lambdas` at `SCALAR_LR` with betas `(0.96, 0.95)`. `dmodel_lr_scale` applied only to embedding-family LRs, matching upstream `setup_optimizer`. |
+| 3 | should-fix | train.py:8 | Dead `HF_HUB_DISABLE_PROGRESS_BARS` env var — no huggingface_hub/datasets consumer. | Removed both the env-var assignment and the now-unused `import os` (grep confirms `os` had no other references). |
+| 4 | nit | train.py:21 | Unused `tree_unflatten` import from `mlx.utils`. | Dropped from the import list; `tree_flatten` and `tree_map` remain (still used). |
+| 5 | nit | train.py:401 | `t_start_training = time.time()` assigned but never read. | Deleted the line; summary block keeps its nine keys unchanged. |
+| 6 | nit | train.py:74,98-99 | RoPE cos/sin end up fp32 because block Linear weights stayed fp32, promoting Q/K back up. | Cast all block matrices (attn c_q/c_k/c_v/c_proj/ve_gate + MLP c_fc/c_proj) to bf16 at end of `init_weights`, matching the existing `wte`/`value_embeds` pattern; added a bf16 cast at `Block.__call__` entry so fp32 residual promotions from the lambda mixers don't re-upcast the block's input. RoPE now sees bf16 Q/K. Verified: MFU jumped from 40.9% (iter 1) to 66.4% at DEPTH=6. |

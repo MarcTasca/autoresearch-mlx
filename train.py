@@ -4,8 +4,6 @@ Single Mac GPU (unified memory), single file. Runs a 5-minute experiment.
 Usage: uv run train.py
 """
 
-import os
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import gc
 import math
@@ -18,7 +16,7 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
-from mlx.utils import tree_flatten, tree_map, tree_unflatten
+from mlx.utils import tree_flatten, tree_map
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -125,6 +123,9 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def __call__(self, x, ve):
+        # Cast to bf16 at the block boundary so RoPE cos/sin, Q/K/V, and the
+        # attention/MLP matmuls all execute in bf16 (matches upstream autocast).
+        x = x.astype(mx.bfloat16)
         x = x + self.attn(rms_norm(x), ve)
         x = x + self.mlp(rms_norm(x))
         return x
@@ -186,10 +187,21 @@ class GPT(nn.Module):
         for ve in self.value_embeds.values():
             ve.weight = mx.random.uniform(low=-s, high=s, shape=ve.weight.shape)
 
-        # Cast embeddings to bf16 (unified memory savings, matches upstream)
+        # Cast bf16-eligible weights (embeddings + block matrices) to bf16 to
+        # match upstream to(dtype=bf16); matmul dtype promotion then flows bf16
+        # through Q/K into RoPE for cos/sin table computation.
         self.transformer.wte.weight = self.transformer.wte.weight.astype(mx.bfloat16)
         for ve in self.value_embeds.values():
             ve.weight = ve.weight.astype(mx.bfloat16)
+        for block in self.transformer.h:
+            block.attn.c_q.weight = block.attn.c_q.weight.astype(mx.bfloat16)
+            block.attn.c_k.weight = block.attn.c_k.weight.astype(mx.bfloat16)
+            block.attn.c_v.weight = block.attn.c_v.weight.astype(mx.bfloat16)
+            block.attn.c_proj.weight = block.attn.c_proj.weight.astype(mx.bfloat16)
+            if block.attn.has_value_embed:
+                block.attn.ve_gate.weight = block.attn.ve_gate.weight.astype(mx.bfloat16)
+            block.mlp.c_fc.weight = block.mlp.c_fc.weight.astype(mx.bfloat16)
+            block.mlp.c_proj.weight = block.mlp.c_proj.weight.astype(mx.bfloat16)
 
     def num_scaling_params(self):
         wte = int(self.transformer.wte.weight.size)
@@ -262,6 +274,8 @@ EMBEDDING_LR = 0.6      # base AdamW LR (routed to embeddings, lm_head, scalars)
 MATRIX_LR = 0.04        # Muon LR for 2-D matrix params (attn / mlp)
 WEIGHT_DECAY = 0.2      # Muon weight decay (annealed toward 0 over the run)
 ADAM_BETAS = (0.8, 0.95) # AdamW betas
+UNEMBEDDING_LR = 0.004  # AdamW LR for lm_head (upstream default)
+SCALAR_LR = 0.5         # AdamW LR for per-layer scalars (upstream default)
 WARMUP_RATIO = 0.0      # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5    # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
@@ -313,18 +327,35 @@ assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
 grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 
 # ---------------------------------------------------------------------------
-# Optimizer: MultiOptimizer([Muon, AdamW]) with a matrix predicate
+# Optimizer: MultiOptimizer with Muon (matrices) + four AdamW groups matching
+# the upstream per-group hyperparameters (lm_head / embeddings / resid / x0).
 # ---------------------------------------------------------------------------
 
 model_dim = config.n_embd
-# 1/sqrt(dmodel) LR scaling applied to the AdamW branch only, tuned at 768 dim
+# 1/sqrt(dmodel) LR scaling applied to embedding-family AdamW LRs only
+# (lm_head, wte, value_embeds); scalar-group LRs are left untouched.
 dmodel_lr_scale = (model_dim / 768) ** -0.5
-adamw_base_lr = EMBEDDING_LR * dmodel_lr_scale
-print(f"Scaling AdamW LR by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
+print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
-def matrix_predicate(path: str, param: mx.array) -> bool:
+lm_head_base_lr   = UNEMBEDDING_LR * dmodel_lr_scale
+embedding_base_lr = EMBEDDING_LR * dmodel_lr_scale
+resid_base_lr     = SCALAR_LR * 0.01
+x0_base_lr        = SCALAR_LR
+
+# Routing predicates. First matching predicate wins; the last optimizer in the
+# MultiOptimizer list is the fallback (no filter). Order matters.
+def is_muon_matrix(path: str, param: mx.array) -> bool:
     """Route 2-D matrix params under transformer.h.* to Muon."""
     return param.ndim == 2 and path.startswith("transformer.h.")
+
+def is_lm_head(path: str, param: mx.array) -> bool:
+    return path == "lm_head.weight"
+
+def is_embedding(path: str, param: mx.array) -> bool:
+    return path == "transformer.wte.weight" or path.startswith("value_embeds.")
+
+def is_resid_lambda(path: str, param: mx.array) -> bool:
+    return path == "resid_lambdas"
 
 muon = optim.Muon(
     learning_rate=MATRIX_LR,
@@ -333,18 +364,45 @@ muon = optim.Muon(
     nesterov=True,
     ns_steps=5,
 )
-adamw = optim.AdamW(
-    learning_rate=adamw_base_lr,
+adamw_lm_head = optim.AdamW(
+    learning_rate=lm_head_base_lr,
     betas=list(ADAM_BETAS),
     eps=1e-10,
     weight_decay=0.0,
 )
-optimizer = optim.MultiOptimizer([muon, adamw], filters=[matrix_predicate])
+adamw_embeds = optim.AdamW(
+    learning_rate=embedding_base_lr,
+    betas=list(ADAM_BETAS),
+    eps=1e-10,
+    weight_decay=0.0,
+)
+adamw_resid = optim.AdamW(
+    learning_rate=resid_base_lr,
+    betas=list(ADAM_BETAS),
+    eps=1e-10,
+    weight_decay=0.0,
+)
+# x0_lambdas is the fallback group; upstream uses a distinct beta1=0.96.
+adamw_x0 = optim.AdamW(
+    learning_rate=x0_base_lr,
+    betas=[0.96, 0.95],
+    eps=1e-10,
+    weight_decay=0.0,
+)
+optimizer = optim.MultiOptimizer(
+    [muon, adamw_lm_head, adamw_embeds, adamw_resid, adamw_x0],
+    filters=[is_muon_matrix, is_lm_head, is_embedding, is_resid_lambda],
+)
 optimizer.init(model.trainable_parameters())
 
-# Snapshot initial LRs so the schedule multiplier scales the *base* LR each step
-muon_initial_lr = MATRIX_LR
-adamw_initial_lr = adamw_base_lr
+# Snapshot initial LRs so the schedule multiplier scales the *base* LR each step.
+lr_schedule_targets = [
+    (muon,          MATRIX_LR),
+    (adamw_lm_head, lm_head_base_lr),
+    (adamw_embeds,  embedding_base_lr),
+    (adamw_resid,   resid_base_lr),
+    (adamw_x0,      x0_base_lr),
+]
 
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
 x, y, epoch = next(train_loader)  # prefetch first batch
@@ -381,24 +439,30 @@ def _loss_fn(model, x, y):
 
 loss_and_grad_fn = nn.value_and_grad(model, _loss_fn)
 
-# Capture model state so mx.compile doesn't retrace on every parameter update
-_state = [model.state, mx.random.state]
+# Capture model + random state so mx.compile doesn't retrace across steps.
+_micro_state = [model.state, mx.random.state]
 
-@partial(mx.compile, inputs=_state, outputs=_state)
+@partial(mx.compile, inputs=_micro_state, outputs=_micro_state)
 def micro_step(x, y):
     return loss_and_grad_fn(model, x, y)
 
+# Compile the accumulator-scale + optimizer.update pass over model + optimizer
+# state; keeps tree-sum accumulation in Python (needed for grad accumulation)
+# but hands the scale-and-apply step to MLX end-to-end.
+_apply_state = [model.state, optimizer.state]
+
+@partial(mx.compile, inputs=_apply_state, outputs=_apply_state)
+def apply_fn(accum_grads):
+    scaled = tree_map(lambda g: g * inv_accum, accum_grads)
+    optimizer.update(model, scaled)
+
 def _tree_add(a, b):
     return tree_map(lambda u, v: u + v, a, b)
-
-def _tree_scale(t, s):
-    return tree_map(lambda u: u * s, t)
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-t_start_training = time.time()
 smooth_train_loss = 0.0
 total_training_time = 0.0
 step = 0
@@ -428,13 +492,12 @@ while True:
     # Progress-driven schedules
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
-    muon.learning_rate = muon_initial_lr * lrm
+    for opt_ref, base_lr in lr_schedule_targets:
+        opt_ref.learning_rate = base_lr * lrm
     muon.momentum = get_muon_momentum(step)
     muon.weight_decay = get_weight_decay(progress)
-    adamw.learning_rate = adamw_initial_lr * lrm
 
-    accum_grads = _tree_scale(accum_grads, inv_accum)
-    optimizer.update(model, accum_grads)
+    apply_fn(accum_grads)
     mx.eval(last_loss, model.parameters(), optimizer.state)
 
     train_loss_f = float(last_loss.item())
